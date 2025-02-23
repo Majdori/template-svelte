@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  #################
+  # REVERSE PROXY #
+  #################
+
+  traefik:
+    container_name: proxy
+    image: traefik:v3
+    command:
+      - '--api.insecure=true'
+      - '--providers.docker=true'
+      - '--providers.docker.exposedbydefault=false'
+      - '--providers.docker.defaultRule=Host(`{{ normalize .ContainerName }}.majdori.xyz`)'
+      - '--entryPoints.http.address=:80'
+      - '--entryPoints.http.http.redirections.entryPoint.to=https'
+      - '--entryPoints.http.http.redirections.entryPoint.scheme=https'
+      - '--entryPoints.https.address=:443'
+      - '--entryPoints.https.http.tls.certResolver=letsencrypt'
+      - '--entryPoints.https.http.tls.domains[0].main=majdori.xyz'
+      - '--entryPoints.https.http.tls.domains[0].sans=*.majdori.xyz'
+      - '--certificatesresolvers.letsencrypt.acme.dnschallenge=true'
+      - '--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare'
+      - '--certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_EMAIL}'
+      - '--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json'
+    environment:
+      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN:?}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '8080:8080'
+    volumes:
+      - ${DATA_PATH}/letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.traefik.rule=Host(`proxy.${PROJECT_NAME}.majdori.xyz`)
+      - traefik.http.services.traefik.loadbalancer.server.port=8080
+      - traefik.http.routers.traefik.entrypoints=https
+      - traefik.http.routers.traefik.tls.certresolver=letsencrypt
+
+  ####################
+  # PROJECT TEMPLATE #
+  ####################
+
+  project:
+    container_name: ${PROJECT_NAME}
+    build:
+      context: .
+    ports:
+      - '${PROJECT_PORT:-3000}:3000'
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      LOKI_URL: http://log-manager:3100
+    depends_on:
+      postgres:
+        condition: service_healthy
+      log-manager:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+
+  ############
+  # DATABASE #
+  ############
+
+  postgres:
+    container_name: database
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ${POSTGRES_VOLUME}:/var/lib/postgresql/data
+
+  nocodb:
+    container_name: database-admin
+    image: nocodb/nocodb:latest
+    restart: always
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+    volumes:
+      - ${NOCODB_VOLUME}:/usr/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.nocodb.rule=Host(`db.${PROJECT_NAME}.majdori.xyz`)
+      - traefik.http.routers.nocodb.entrypoints=https
+      - traefik.http.routers.nocodb.tls.certresolver=letsencrypt
+
+  ###########
+  # LOGGING #
+  ###########
+
+  log-manager:
+    container_name: log-manager
+    image: grafana/loki:latest
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yml:/etc/loki/loki-config.yml:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'wget --spider -q http://localhost:3100/ready || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    container_name: log-viewer
+    image: grafana/grafana:latest
+    depends_on:
+      log-manager:
+        condition: service_healthy
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.grafana.rule=Host(`logs.${PROJECT_NAME}.majdori.xyz`)
+      - traefik.http.routers.grafana.entrypoints=https
+      - traefik.http.routers.grafana.tls.certresolver=letsencrypt
